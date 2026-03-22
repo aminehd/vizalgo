@@ -2,7 +2,9 @@ import functools
 import inspect
 import sys
 import textwrap
+from collections.abc import Mapping
 from .event import Snapshot
+from .state import VizGrid, VizQueue
 
 
 class VizEngine:
@@ -20,14 +22,78 @@ class VizEngine:
 
         self.config = None
 
+    # ── Internal ────────────────────────────────────────────────────────────
+
+    def _record(self, description: str, data: dict):
+        """Append a snapshot, or replace the last micro-snap if on the same line."""
+        line     = self._trace_line
+        duration = self.snap_speed
+        if (self.snapshots
+                and self.snapshots[-1].line == line
+                and self.snapshots[-1].duration <= self.line_speed):
+            self.snapshots[-1] = Snapshot(
+                description=description, duration=duration, line=line, data=data
+            )
+        else:
+            self.snapshots.append(Snapshot(
+                description=description, duration=duration, line=line, data=data
+            ))
+
+    def _serialize(self, val, ann: dict):
+        """
+        Type-dispatch: turn a Python value + annotation into snapshot-safe data.
+        Returns None for types we can't meaningfully display (skipped).
+
+        ann keys per type:
+          list/tuple  → cursor (int), window ([l, r])
+          dict        → highlight (key)
+          VizGrid     → cursor (r,c), neighbors [(r,c),...]
+        """
+        if isinstance(val, VizGrid):
+            if "cursor"    in ann: val.cursor    = ann["cursor"]
+            if "neighbors" in ann: val.neighbors = ann["neighbors"]
+            return val.snapshot()
+
+        if isinstance(val, VizQueue):
+            return val.snapshot()
+
+        if isinstance(val, (list, tuple)):
+            try:
+                return {
+                    "type":   "array",
+                    "values": list(val),
+                    "cursor": ann.get("cursor"),
+                    "window": list(ann["window"]) if "window" in ann else None,
+                }
+            except Exception:
+                return None
+
+        if isinstance(val, Mapping):
+            try:
+                return {
+                    "type":      "hashmap",
+                    "entries":   {str(k): v for k, v in val.items()},
+                    "highlight": ann.get("highlight"),
+                }
+            except Exception:
+                return None
+
+        if isinstance(val, (int, float, bool)):
+            return val
+
+        if isinstance(val, str) and len(val) < 80:
+            return val
+
+        return None  # skip everything else
+
+    # ── Public API ───────────────────────────────────────────────────────────
+
     def snap(self, description="", **explicit_data):
         """
         Record a frame with state data.
         If config is set, auto-captures state from the call stack.
         If the auto-tracer already added a micro-snap for this line, replace it.
         """
-        line = self._trace_line
-
         # Auto-capture from call stack if config is set
         if self.config is not None:
             frame = inspect.currentframe().f_back
@@ -42,18 +108,38 @@ class VizEngine:
         else:
             data = explicit_data
 
-        duration = self.snap_speed
-        if (self.snapshots
-                and self.snapshots[-1].line == line
-                and self.snapshots[-1].duration <= self.line_speed):
-            # Replace micro-snap with the full snap
-            self.snapshots[-1] = Snapshot(
-                description=description, duration=duration, line=line, data=data
+        self._record(description, data)
+
+    def step(self, locals_dict: dict, mark: dict = None, label: str = ""):
+        """
+        Clean single-call snapshot API.
+
+        Usage:
+            engine.step(
+                locals(),
+                mark={
+                    "nums": {"cursor": i},
+                    "acc":  {"highlight": prefix_sum - k},
+                    "grid": {"cursor": (cr, cc), "neighbors": [(nr, nc)]},
+                    "nums": {"window": (left, right)},
+                },
+                label="processing element i"
             )
-        else:
-            self.snapshots.append(Snapshot(
-                description=description, duration=duration, line=line, data=data
-            ))
+
+        - Pass locals() to capture all variables automatically.
+        - mark: optional per-variable annotations (cursor, window, highlight, neighbors).
+        - Variables starting with '_', 'self', or callables are skipped.
+        - Unknown types are silently skipped — never crashes.
+        """
+        mark = mark or {}
+        data = {}
+        for key, val in locals_dict.items():
+            if key.startswith("_") or key == "self" or callable(val):
+                continue
+            serialized = self._serialize(val, mark.get(key, {}))
+            if serialized is not None:
+                data[key] = serialized
+        self._record(label, data)
 
     def show(self, fn):
         """
