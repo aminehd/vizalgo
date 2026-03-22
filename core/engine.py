@@ -110,43 +110,48 @@ class VizEngine:
 
         self._record(description, data)
 
-    def step(self, locals_dict: dict, mark: dict = None, label: str = ""):
-        """
-        Clean single-call snapshot API.
-
-        Usage:
-            engine.step(
-                locals(),
-                mark={
-                    "nums": {"cursor": i},
-                    "acc":  {"highlight": prefix_sum - k},
-                    "grid": {"cursor": (cr, cc), "neighbors": [(nr, nc)]},
-                    "nums": {"window": (left, right)},
-                },
-                label="processing element i"
-            )
-
-        - Pass locals() to capture all variables automatically.
-        - mark: optional per-variable annotations (cursor, window, highlight, neighbors).
-        - Variables starting with '_', 'self', or callables are skipped.
-        - Unknown types are silently skipped — never crashes.
-        """
-        mark = mark or {}
+    def _serialize_locals(self, locs: dict, mark_dict: dict) -> dict:
+        """Serialize a locals dict using type-dispatch, applying mark annotations."""
         data = {}
-        for key, val in locals_dict.items():
+        for key, val in locs.items():
             if key.startswith("_") or key == "self" or callable(val):
                 continue
-            serialized = self._serialize(val, mark.get(key, {}))
+            serialized = self._serialize(val, mark_dict.get(key, {}))
             if serialized is not None:
                 data[key] = serialized
+        return data
+
+    def step(self, locals_dict: dict, mark: dict = None, label: str = ""):
+        """
+        Explicit snapshot from locals() — kept for backwards compatibility.
+        Prefer @engine.show(mark=...) for clean zero-intrusion tracing.
+        """
+        data = self._serialize_locals(locals_dict, mark or {})
         self._record(label, data)
 
-    def show(self, fn):
+    def show(self, fn=None, *, mark=None):
         """
-        Decorator: pins which function's source shows in the code panel AND
-        installs sys.settrace so every line gets a micro-snapshot (0.15 s),
-        making the pointer animate line-by-line.
+        Decorator: pins source + installs tracer that auto-snapshots every line.
+
+        Two usage patterns:
+
+          @engine.show                           # auto-capture, no annotations
+          @engine.show(mark=lambda locs: {...})  # auto-capture + cursor/highlight
+
+        mark: callable(locals_dict) → mark_dict
+              locs is frame.f_locals at that line — use .get() for safety:
+
+              mark=lambda locs: {
+                  "nums": {"cursor": locs.get("i")},
+                  "acc":  {"highlight": locs.get("prefix_sum", 0) - locs.get("k", 0)},
+              }
+
+        Algorithm code stays completely pure — no engine calls needed inside.
         """
+        # @engine.show(mark=...) — called with args, return the real decorator
+        if fn is None:
+            return lambda f: self.show(f, mark=mark)
+
         try:
             src = inspect.getsource(fn)
             self.source_lines   = textwrap.dedent(src).splitlines()
@@ -154,31 +159,30 @@ class VizEngine:
         except Exception:
             pass
 
-        fn_code      = fn.__code__
-        fn_qualname  = fn.__qualname__   # e.g. "numIslands"
-        engine       = self
+        fn_code     = fn.__code__
+        fn_qualname = fn.__qualname__
+        engine      = self
 
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             def local_tracer(frame, event, arg):
                 if event == 'line':
                     engine._trace_line = frame.f_lineno - engine._fn_start_line
-                    prev = engine.snapshots[-1] if engine.snapshots else None
-                    # Add micro-snap only when moving to a new line
-                    if not prev or prev.line != engine._trace_line:
-                        engine.snapshots.append(Snapshot(
-                            description=prev.description if prev else "",
-                            duration=engine.line_speed,
-                            line=engine._trace_line,
-                            data=dict(prev.data) if prev else {},
-                        ))
+                    locs      = dict(frame.f_locals)
+                    mark_dict = {}
+                    if mark:
+                        try:
+                            mark_dict = mark(locs)
+                        except Exception:
+                            pass
+                    data = engine._serialize_locals(locs, mark_dict)
+                    engine._record("", data)
                 return local_tracer
 
             def global_tracer(frame, event, arg):
                 if event == 'call':
                     if frame.f_code is fn_code:
                         return local_tracer
-                    # Also trace nested functions defined inside fn (e.g. bfs inside numIslands)
                     fq = getattr(frame.f_code, 'co_qualname', '')
                     if fq.startswith(fn_qualname + '.<locals>.'):
                         return local_tracer
